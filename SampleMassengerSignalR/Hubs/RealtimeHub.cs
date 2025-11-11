@@ -52,15 +52,6 @@ public class RealtimeHub : Hub
         }
     }
 
-    // lightweight DTO for clients
-    public class UserInfo
-    {
-        public string UserName { get; set; } = string.Empty;
-        public string Name { get; set; } = string.Empty;
-        public string? ConnectionId { get; set; }
-        public DateTime ConnectedAt { get; set; }
-    }
-
     public override async Task OnConnectedAsync()
     {
         await Clients.Caller.SendAsync("Connected", Context.ConnectionId);
@@ -77,6 +68,7 @@ public class RealtimeHub : Hub
     // register/login
     public async Task<object> Register(string userName, string name)
     {
+        userName = userName.ToLower().Trim();
         var user = _repo.AddUser(userName, name, Context.ConnectionId);
         await Groups.AddToGroupAsync(Context.ConnectionId, userName); // personal room
 
@@ -88,6 +80,7 @@ public class RealtimeHub : Hub
     // check if user exists
     public Task<object> CheckUser(string userName)
     {
+        userName = userName.ToLower().Trim();
         if (string.IsNullOrWhiteSpace(userName))
             return Task.FromResult<object>(new { success = false, error = "userName required" });
 
@@ -103,6 +96,7 @@ public class RealtimeHub : Hub
     // get conversations
     public Task<IEnumerable<ConversationSummary>> GetConversations(string userName)
     {
+        userName = userName.ToLower().Trim();
         var convs = _repo.GetUserConversations(userName);
         return Task.FromResult(convs);
     }
@@ -110,6 +104,9 @@ public class RealtimeHub : Hub
     // get messages between two users
     public async Task<object> GetMessages(string from, string to)
     {
+        from = from.ToLower().Trim();
+        to = to.ToLower().Trim();
+
         var conv = _repo.GetChat(from, to).ToList();
         var user = _repo.GetUser(to);
         return await Task.FromResult<object>(new { messages = conv, user });
@@ -120,6 +117,9 @@ public class RealtimeHub : Hub
     {
         if (string.IsNullOrWhiteSpace(from) || string.IsNullOrWhiteSpace(to) || string.IsNullOrWhiteSpace(text))
             return new { success = false };
+
+        from = from.ToLower().Trim();
+        to = to.ToLower().Trim();
 
         var record = new MessageRecord
         {
