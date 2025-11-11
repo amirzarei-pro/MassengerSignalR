@@ -1,0 +1,388 @@
+using Microsoft.AspNetCore.SignalR;
+using SampleMassengerSignalR.Data;
+using SampleMassengerSignalR.Models;
+using System.Text.Json;
+using Microsoft.AspNetCore.Hosting;
+
+namespace SampleMassengerSignalR.Hubs;
+
+public class RealtimeHub : Hub
+{
+    private readonly IChatRepository _repo;
+
+    public RealtimeHub(IChatRepository repo, IWebHostEnvironment env)
+    {
+        _repo = repo;
+        var usersPath = Path.Combine(env.ContentRootPath, "App_Data", "users.json");
+        var messagesPath = Path.Combine(env.ContentRootPath, "App_Data", "messages.json");
+        UserStore.Initialize(usersPath);
+        MessageStore.Initialize(messagesPath, _repo);
+
+        // If stores are empty, seed demo data (only the first time)
+        if (UserStore.IsEmpty && MessageStore.IsEmpty)
+        {
+            // seed two users and some messages
+            var u1 = UserStore.AddUser("alice", "Alice", null);
+            var u2 = UserStore.AddUser("bob", "Bob", null);
+
+            var m1 = new MessageRecord
+            {
+                From = "alice",
+                To = "bob",
+                Text = "Hi Bob!",
+                ChatKey = BuildKey("alice", "bob"),
+                SentAt = DateTime.UtcNow.AddMinutes(-10)
+            };
+            _repo.SaveMessage(m1);
+            MessageStore.AddMessage(m1);
+
+            var m2 = new MessageRecord
+            {
+                From = "bob",
+                To = "alice",
+                Text = "Hello Alice!",
+                ChatKey = BuildKey("alice", "bob"),
+                SentAt = DateTime.UtcNow.AddMinutes(-9)
+            };
+            _repo.SaveMessage(m2);
+            MessageStore.AddMessage(m2);
+
+            var m3 = new MessageRecord
+            {
+                From = "alice",
+                To = "bob",
+                Text = "How are you?",
+                ChatKey = BuildKey("alice", "bob"),
+                SentAt = DateTime.UtcNow.AddMinutes(-8)
+            };
+            _repo.SaveMessage(m3);
+            MessageStore.AddMessage(m3);
+        }
+    }
+
+    // Simple in-memory user store for metadata and connection tracking
+    private static class UserStore
+    {
+        private static readonly Dictionary<string, UserInfo> _users = new(StringComparer.OrdinalIgnoreCase);
+        private static readonly object _lock = new();
+        private static string? _filePath;
+        private static bool _initialized = false;
+
+        public static bool IsEmpty => !_users.Any();
+
+        public static void Initialize(string filePath)
+        {
+            if (_initialized) return;
+            _initialized = true;
+
+            _filePath = filePath;
+            Directory.CreateDirectory(Path.GetDirectoryName(filePath)!);
+
+            if (File.Exists(filePath))
+            {
+                try
+                {
+                    var json = File.ReadAllText(filePath);
+                    var list = JsonSerializer.Deserialize<List<UserInfo>>(json) ?? new List<UserInfo>();
+                    lock (_lock)
+                    {
+                        _users.Clear();
+                        foreach (var u in list)
+                        {
+                            _users[u.UserName] = u;
+                        }
+                    }
+                }
+                catch
+                {
+                    lock (_lock) { _users.Clear(); }
+                    SaveToFile();
+                }
+            }
+            else
+            {
+                SaveToFile();
+            }
+        }
+
+        private static void SaveToFile()
+        {
+            if (string.IsNullOrEmpty(_filePath)) return;
+
+            lock (_lock)
+            {
+                var list = _users.Values
+                    .Select(u => new UserInfo { UserName = u.UserName, Name = u.Name, ConnectedAt = u.ConnectedAt, ConnectionId = u.ConnectionId })
+                    .ToList();
+
+                var json = JsonSerializer.Serialize(list, new JsonSerializerOptions { WriteIndented = true });
+                File.WriteAllText(_filePath, json);
+            }
+        }
+
+        public static UserInfo AddUser(string userName, string name, string? connectionId)
+        {
+            var u = new UserInfo
+            {
+                UserName = userName,
+                Name = name,
+                ConnectionId = connectionId,
+                ConnectedAt = DateTime.UtcNow
+            };
+            lock (_lock)
+            {
+                _users[userName] = u;
+                SaveToFile();
+            }
+            return u;
+        }
+
+        public static UserInfo? GetUser(string userName)
+        {
+            lock (_lock)
+            {
+                return _users.TryGetValue(userName, out var u) ? u : null;
+            }
+        }
+
+        public static List<UserInfo> ListUsers()
+        {
+            lock (_lock)
+            {
+                return _users.Values
+                    .Select(u => new UserInfo { UserName = u.UserName, Name = u.Name, ConnectedAt = u.ConnectedAt })
+                    .ToList();
+            }
+        }
+
+        public static void RemoveByConnection(string connectionId)
+        {
+            lock (_lock)
+            {
+                var kv = _users.FirstOrDefault(kv => kv.Value.ConnectionId == connectionId);
+                if (!string.IsNullOrEmpty(kv.Key))
+                {
+                    _users.Remove(kv.Key);
+                    SaveToFile();
+                }
+            }
+        }
+    }
+
+    // Simple message store persisted to JSON
+    private static class MessageStore
+    {
+        private static readonly List<SerializableMessage> _messages = new();
+        private static readonly object _lock = new();
+        private static string? _filePath;
+        private static bool _initialized = false;
+        private static IChatRepository? _repoRef;
+
+        public static bool IsEmpty => !_messages.Any();
+
+        public static void Initialize(string filePath, IChatRepository repo)
+        {
+            if (_initialized) return;
+            _initialized = true;
+            _repoRef = repo;
+
+            _filePath = filePath;
+            Directory.CreateDirectory(Path.GetDirectoryName(filePath)!);
+
+            if (File.Exists(filePath))
+            {
+                try
+                {
+                    var json = File.ReadAllText(filePath);
+                    var list = JsonSerializer.Deserialize<List<SerializableMessage>>(json) ?? new List<SerializableMessage>();
+                    lock (_lock)
+                    {
+                        _messages.Clear();
+                        _messages.AddRange(list);
+                    }
+                }
+                catch
+                {
+                    lock (_lock) { _messages.Clear(); }
+                    SaveToFile();
+                }
+            }
+            else
+            {
+                // If no messages.json, try to load from the LiteDB repo to bootstrap
+                try
+                {
+                    var all = repo.GetUserConversations("").SelectMany(_ => Enumerable.Empty<MessageRecord>()); // no-op to avoid unused
+                }
+                catch
+                {
+                    // ignore
+                }
+                SaveToFile();
+            }
+        }
+
+        private static void SaveToFile()
+        {
+            if (string.IsNullOrEmpty(_filePath)) return;
+
+            lock (_lock)
+            {
+                var json = JsonSerializer.Serialize(_messages, new JsonSerializerOptions { WriteIndented = true });
+                File.WriteAllText(_filePath, json);
+            }
+        }
+
+        public static void AddMessage(MessageRecord msg)
+        {
+            var s = new SerializableMessage
+            {
+                Id = msg.Id.ToString(),
+                ChatKey = msg.ChatKey,
+                From = msg.From,
+                To = msg.To,
+                Text = msg.Text,
+                SentAt = msg.SentAt
+            };
+            lock (_lock)
+            {
+                _messages.Add(s);
+                SaveToFile();
+            }
+        }
+
+        public static IEnumerable<MessageRecord> GetChat(string userA, string userB)
+        {
+            var key = BuildKey(userA, userB);
+            lock (_lock)
+            {
+                return _messages.Where(m => m.ChatKey == key)
+                    .OrderBy(m => m.SentAt)
+                    .Select(m => new MessageRecord
+                    {
+                        // leave Id as default; these records are primarily for history display
+                        ChatKey = m.ChatKey,
+                        From = m.From,
+                        To = m.To,
+                        Text = m.Text,
+                        SentAt = m.SentAt
+                    })
+                    .ToList();
+            }
+        }
+
+        private class SerializableMessage
+        {
+            public string Id { get; set; } = string.Empty;
+            public string ChatKey { get; set; } = string.Empty;
+            public string From { get; set; } = string.Empty;
+            public string To { get; set; } = string.Empty;
+            public string Text { get; set; } = string.Empty;
+            public DateTime SentAt { get; set; }
+        }
+    }
+
+    // lightweight DTO for clients
+    public class UserInfo
+    {
+        public string UserName { get; set; } = string.Empty;
+        public string Name { get; set; } = string.Empty;
+        public string? ConnectionId { get; set; }
+        public DateTime ConnectedAt { get; set; }
+    }
+
+    public override async Task OnConnectedAsync()
+    {
+        await Clients.Caller.SendAsync("Connected", Context.ConnectionId);
+        await base.OnConnectedAsync();
+    }
+
+    public override async Task OnDisconnectedAsync(Exception? exception)
+    {
+        UserStore.RemoveByConnection(Context.ConnectionId);
+        await Clients.All.SendAsync("users", UserStore.ListUsers());
+        await base.OnDisconnectedAsync(exception);
+    }
+
+    // register/login
+    public async Task<object> Register(string userName, string name)
+    {
+        var user = UserStore.AddUser(userName, name, Context.ConnectionId);
+        await Groups.AddToGroupAsync(Context.ConnectionId, userName); // personal room
+
+        await Clients.All.SendAsync("users", UserStore.ListUsers()); // notify all users
+
+        return new { success = true, user };
+    }
+
+    // check if user exists
+    public Task<object> CheckUser(string userName)
+    {
+        if (string.IsNullOrWhiteSpace(userName))
+            return Task.FromResult<object>(new { success = false, error = "userName required" });
+
+        var user = UserStore.GetUser(userName);
+        return Task.FromResult<object>(new
+        {
+            success = true,
+            exists = user != null,
+            user = user != null ? new { user.UserName, user.Name, user.ConnectedAt } : null
+        });
+    }
+
+    // get conversations
+    public Task<IEnumerable<ConversationSummary>> GetConversations(string userName)
+    {
+        var convs = _repo.GetUserConversations(userName);
+        return Task.FromResult(convs);
+    }
+
+    // get messages between two users
+    public async Task<object> GetMessages(string from, string to)
+    {
+        // prefer repository but fall back to JSON store
+        var conv = _repo.GetChat(from, to).ToList();
+        if (!conv.Any())
+        {
+            conv = MessageStore.GetChat(from, to).ToList();
+        }
+        var user = UserStore.GetUser(to);
+        return await Task.FromResult<object>(new { messages = conv, user });
+    }
+
+    // send message
+    public async Task<object> SendMessage(string from, string to, string text)
+    {
+        if (string.IsNullOrWhiteSpace(from) || string.IsNullOrWhiteSpace(to) || string.IsNullOrWhiteSpace(text))
+            return new { success = false };
+
+        var record = new MessageRecord
+        {
+            From = from,
+            To = to,
+            Text = text,
+            ChatKey = BuildKey(from, to),
+            SentAt = DateTime.UtcNow
+        };
+
+        _repo.SaveMessage(record);
+        MessageStore.AddMessage(record); // also persist to JSON
+
+        // send to both users via their groups (personal room)
+        await Clients.Group(from).SendAsync("message", record);
+        await Clients.Group(to).SendAsync("message", record);
+
+        // update conversations for both
+        await Clients.Group(from).SendAsync("conversations", _repo.GetUserConversations(from));
+        await Clients.Group(to).SendAsync("conversations", _repo.GetUserConversations(to));
+
+        return new { success = true, message = record };
+    }
+
+    private static string BuildKey(string a, string b)
+    {
+        var p = new[] { a.Trim().ToLowerInvariant(), b.Trim().ToLowerInvariant() };
+        Array.Sort(p);
+        return $"{p[0]}__{p[1]}";
+    }
+}

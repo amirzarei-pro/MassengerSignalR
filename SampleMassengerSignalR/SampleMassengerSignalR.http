@@ -1,0 +1,6 @@
+@SampleMassengerSignalR_HostAddress = http://localhost:5219
+
+GET {{SampleMassengerSignalR_HostAddress}}/weatherforecast/
+Accept: application/json
+
+###
